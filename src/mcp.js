@@ -9,8 +9,8 @@ const INSTRUCTIONS =
   "#pragma lines. Check page metadata for concurrent edits and read back after " +
   "writes. Confirm destructive operations with the user. Attachment content is base64. " +
   "Use the returned url fields to give the user links to relevant wiki pages. " +
-  "To upload an attachment that is reachable at a URL, use put_attachment with source_url; for a file over " +
-  "about 75 KB without a URL, use put_attachment_chunk and then finish_attachment_upload.";
+  "To upload an attachment that is reachable at a URL, use put_attachment with source_url; for any other file " +
+  "over about 75 KB, use create_upload_link and upload it with curl, or give the user the link to open.";
 
 const json = (body, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
@@ -46,7 +46,7 @@ async function handleMessage(msg, settings) {
       return ok(msg.id, {
         protocolVersion: SUPPORTED_VERSIONS.includes(asked) ? asked : SUPPORTED_VERSIONS[0],
         capabilities: { tools: { listChanged: false } },
-        serverInfo: { name: "MoinMoin", version: "0.3.0" },
+        serverInfo: { name: "MoinMoin", version: "0.4.0" },
         instructions: INSTRUCTIONS,
       });
     }

@@ -1,6 +1,6 @@
 {
   "name": "moinmoin-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Cloudflare Worker MCP server for a MoinMoin 1.9 wiki over XML-RPC",

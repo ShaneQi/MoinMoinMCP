@@ -9,7 +9,7 @@ export class ConfigError extends Error {}
 /** A wiki operation failure, reported to Claude as a tool error. */
 export class WikiError extends Error {}
 
-/** { url, username, password, allowWrites } from the Worker's env; throws ConfigError. */
+/** { url, username, password, allowWrites, uploadSecret } from the Worker's env; throws ConfigError. */
 export function wikiSettings(env) {
   const url = (env.MOIN_URL ?? "").trim();
   endpoint(url);
@@ -20,7 +20,9 @@ export function wikiSettings(env) {
   }
   const writes = String(env.ALLOW_WRITES ?? "false").toLowerCase();
   if (writes !== "true" && writes !== "false") throw new ConfigError("ALLOW_WRITES must be true or false");
-  return { url, username, password, allowWrites: writes === "true" };
+  const uploadSecret = env.UPLOAD_SECRET ?? "";
+  if (uploadSecret && uploadSecret.length < 32) throw new ConfigError("UPLOAD_SECRET must be at least 32 characters");
+  return { url, username, password, allowWrites: writes === "true", uploadSecret };
 }
 
 function parseUrl(url) {
@@ -67,7 +69,7 @@ async function post(url, method, params) {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.3" },
+      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.4" },
       body: encodeCallBytes(method, params),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
@@ -105,40 +107,6 @@ async function authToken(url, settings) {
   const token = await post(url, "getAuthToken", [settings.username, settings.password]);
   if (!token) throw new WikiError("AUTH_FAILED: wiki rejected the username or password");
   return token;
-}
-
-/**
- * Calls several wiki methods through system.multicall, `groupSize` calls per
- * request, all with one auth token. A tool can then touch many attachments
- * without running into the Worker's subrequest limit, and a group bounds how
- * much one response holds. Returns, per call, { value } or { error } (a
- * WikiError); one failing call does not stop the others.
- */
-export async function callWikiBatch(settings, calls, groupSize = 100) {
-  if (!calls.length) return [];
-  const url = endpoint(settings.url);
-  const token = settings.username ? await authToken(url, settings) : null;
-  const out = [];
-  for (let i = 0; i < calls.length; i += groupSize) {
-    const entries = calls.slice(i, i + groupSize).map(([methodName, ...params]) => ({ methodName, params }));
-    const auth = token ? [{ methodName: "applyAuthToken", params: [token] }] : [];
-    const results = await post(url, "system.multicall", [[...auth, ...entries]]);
-    if (!Array.isArray(results) || results.length !== auth.length + entries.length) {
-      throw new WikiError("NOT_XMLRPC: unexpected multicall result from the wiki");
-    }
-    if (auth.length && multicallResult(results[0]) !== "SUCCESS") {
-      throw new WikiError("AUTH_FAILED: wiki rejected the authentication token");
-    }
-    for (const entry of results.slice(auth.length)) {
-      try {
-        out.push({ value: multicallResult(entry) });
-      } catch (e) {
-        if (!(e instanceof WikiError)) throw e;
-        out.push({ error: e });
-      }
-    }
-  }
-  return out;
 }
 
 /**
