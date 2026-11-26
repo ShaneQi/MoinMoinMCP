@@ -48,8 +48,28 @@ export function bytesToBase64(bytes) {
   return btoa(s);
 }
 
+const B64_INDEX = new Int16Array(128).fill(-1);
+for (let i = 0; i < 64; i++) B64_INDEX["ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".charCodeAt(i)] = i;
+
+/** Strict standard base64 (padding required) to bytes, without an intermediate string; throws on bad input. */
 export function base64ToBytes(b64) {
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  if (b64.length % 4) throw new TypeError("bad base64 length");
+  let end = b64.length;
+  while (end > 0 && b64.charCodeAt(end - 1) === 61 && b64.length - end < 2) end--;
+  const out = new Uint8Array(Math.floor((end * 3) / 4));
+  let o = 0, acc = 0, bits = 0;
+  for (let i = 0; i < end; i++) {
+    const c = b64.charCodeAt(i);
+    const v = c < 128 ? B64_INDEX[c] : -1;
+    if (v < 0) throw new TypeError("bad base64 character");
+    acc = (acc << 6) | v;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      out[o++] = (acc >> bits) & 0xff;
+    }
+  }
+  return out;
 }
 
 function encodeValue(v) {
@@ -73,6 +93,67 @@ function encodeValue(v) {
 export function encodeCall(method, params) {
   return `<?xml version="1.0"?>\n<methodCall><methodName>${escapeXml(method)}</methodName><params>` +
     params.map((p) => `<param>${encodeValue(p)}</param>`).join("") + "</params></methodCall>";
+}
+
+const BLOB = "\u0000";
+const B64 = new TextEncoder().encode("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+const PAD = 61; // "="
+
+// Writes bytes as base64 ASCII into out at offset; returns the new offset.
+function writeBase64(bytes, out, at) {
+  const n = bytes.length, full = n - (n % 3);
+  for (let i = 0; i < full; i += 3) {
+    const v = (bytes[i] << 16) | (bytes[i + 1] << 8) | bytes[i + 2];
+    out[at++] = B64[v >> 18]; out[at++] = B64[(v >> 12) & 63]; out[at++] = B64[(v >> 6) & 63]; out[at++] = B64[v & 63];
+  }
+  if (n - full === 1) {
+    const v = bytes[full] << 16;
+    out[at++] = B64[v >> 18]; out[at++] = B64[(v >> 12) & 63]; out[at++] = PAD; out[at++] = PAD;
+  } else if (n - full === 2) {
+    const v = (bytes[full] << 16) | (bytes[full + 1] << 8);
+    out[at++] = B64[v >> 18]; out[at++] = B64[(v >> 12) & 63]; out[at++] = B64[(v >> 6) & 63]; out[at++] = PAD;
+  }
+  return at;
+}
+
+/**
+ * encodeCall as UTF-8 bytes. Binary values are base64-encoded straight into
+ * the output, so a large attachment is held once as bytes and once as the
+ * request body, with no intermediate strings.
+ */
+export function encodeCallBytes(method, params) {
+  const blobs = [];
+  // Encode with a placeholder string (NUL, which XML can't carry anyway) for
+  // each binary value, then splice the base64 in.
+  const swap = (v) => {
+    if (v instanceof Uint8Array) {
+      blobs.push(v);
+      return BLOB;
+    }
+    if (Array.isArray(v)) return v.map(swap);
+    if (v && typeof v === "object" && !(v instanceof XmlRpcDateTime)) return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, swap(x)]));
+    return v;
+  };
+  const xml = encodeCall(method, params.map(swap));
+  const pieces = xml.split(`<value><string>${BLOB}</string></value>`);
+  if (pieces.length !== blobs.length + 1) throw new TypeError("cannot encode strings containing NUL");
+  const enc = new TextEncoder();
+  const text = pieces.map((p, i) => enc.encode(i < blobs.length ? `${p}<value><base64>` : p));
+  const close = enc.encode("</base64></value>");
+  let size = text.reduce((n, t) => n + t.length, 0);
+  for (const b of blobs) size += Math.ceil(b.length / 3) * 4 + close.length;
+  const out = new Uint8Array(size);
+  let at = 0;
+  text.forEach((t, i) => {
+    out.set(t, at);
+    at += t.length;
+    if (i < blobs.length) {
+      at = writeBase64(blobs[i], out, at);
+      out.set(close, at);
+      at += close.length;
+    }
+  });
+  return out;
 }
 
 export function encodeResponse(value) {

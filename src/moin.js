@@ -1,5 +1,5 @@
 // MoinMoin XML-RPC v2 access, with per-call authentication and no shared sessions.
-import { decodeResponse, encodeCall, XmlRpcFault, XmlRpcParseError } from "./xmlrpc.js";
+import { decodeResponse, encodeCallBytes, XmlRpcFault, XmlRpcParseError } from "./xmlrpc.js";
 
 const FETCH_TIMEOUT_MS = 60_000;
 
@@ -67,13 +67,18 @@ async function post(url, method, params) {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.2" },
-      body: encodeCall(method, params),
+      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.3" },
+      body: encodeCallBytes(method, params),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });
   } catch (e) {
     console.warn(`wiki request failed (${e?.name ?? "error"})`);
     throw new WikiError("NETWORK: could not reach the wiki; check MOIN_URL and that the wiki is reachable");
+  }
+  if (res.status === 413) {
+    throw new WikiError(
+      "TOO_LARGE: the wiki's web server refused the request as too large (HTTP 413); " +
+      "raise its request size limit (e.g. nginx client_max_body_size) or upload a smaller file");
   }
   if (!res.ok) throw new WikiError(`Wiki returned HTTP ${res.status}; check MOIN_URL and XML-RPC access`);
   const body = await res.text();
@@ -95,6 +100,47 @@ function multicallResult(entry) {
   throw new WikiError("NOT_XMLRPC: unexpected multicall result from the wiki");
 }
 
+// With credentials: a fresh auth token, or AUTH_FAILED.
+async function authToken(url, settings) {
+  const token = await post(url, "getAuthToken", [settings.username, settings.password]);
+  if (!token) throw new WikiError("AUTH_FAILED: wiki rejected the username or password");
+  return token;
+}
+
+/**
+ * Calls several wiki methods through system.multicall, `groupSize` calls per
+ * request, all with one auth token. A tool can then touch many attachments
+ * without running into the Worker's subrequest limit, and a group bounds how
+ * much one response holds. Returns, per call, { value } or { error } (a
+ * WikiError); one failing call does not stop the others.
+ */
+export async function callWikiBatch(settings, calls, groupSize = 100) {
+  if (!calls.length) return [];
+  const url = endpoint(settings.url);
+  const token = settings.username ? await authToken(url, settings) : null;
+  const out = [];
+  for (let i = 0; i < calls.length; i += groupSize) {
+    const entries = calls.slice(i, i + groupSize).map(([methodName, ...params]) => ({ methodName, params }));
+    const auth = token ? [{ methodName: "applyAuthToken", params: [token] }] : [];
+    const results = await post(url, "system.multicall", [[...auth, ...entries]]);
+    if (!Array.isArray(results) || results.length !== auth.length + entries.length) {
+      throw new WikiError("NOT_XMLRPC: unexpected multicall result from the wiki");
+    }
+    if (auth.length && multicallResult(results[0]) !== "SUCCESS") {
+      throw new WikiError("AUTH_FAILED: wiki rejected the authentication token");
+    }
+    for (const entry of results.slice(auth.length)) {
+      try {
+        out.push({ value: multicallResult(entry) });
+      } catch (e) {
+        if (!(e instanceof WikiError)) throw e;
+        out.push({ error: e });
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Calls one wiki method. With credentials, it gets a fresh auth token and sends
  * applyAuthToken + the call as one system.multicall, as Moin's xmlrpc2 expects.
@@ -103,8 +149,7 @@ export async function callWiki(settings, method, params) {
   const url = endpoint(settings.url);
   let result;
   if (settings.username) {
-    const token = await post(url, "getAuthToken", [settings.username, settings.password]);
-    if (!token) throw new WikiError("AUTH_FAILED: wiki rejected the username or password");
+    const token = await authToken(url, settings);
     const results = await post(url, "system.multicall", [[
       { methodName: "applyAuthToken", params: [token] },
       { methodName: method, params },

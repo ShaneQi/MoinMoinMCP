@@ -1,0 +1,11 @@
+{
+  "name": "moinmoin-mcp",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker MCP server for a MoinMoin 1.9 wiki over XML-RPC",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}
