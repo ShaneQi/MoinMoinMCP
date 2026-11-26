@@ -2,11 +2,9 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { TOOLS, runTool, decodeBase64Arg, MAX_ATTACHMENT_BYTES } from "../src/tools.js";
-import { uploadClient, UPLOAD_TTL_MS } from "../src/uploads.js";
 import { installFakeWiki, WIKI } from "./fake-wiki.js";
-import { fakeNamespace } from "./fake-durable-object.js";
 
-let SETTINGS, uploads;
+const SETTINGS = { url: WIKI, username: "bot", password: "pw", allowWrites: true };
 const tool = (name) => TOOLS.find((t) => t.name === name);
 async function call(name, args, settings = SETTINGS) {
   const r = await runTool(tool(name), args, settings);
@@ -18,8 +16,6 @@ const b64 = (b) => Buffer.from(b).toString("base64");
 
 let wiki;
 beforeEach(() => {
-  uploads = fakeNamespace();
-  SETTINGS = { url: WIKI, username: "bot", password: "pw", allowWrites: true, uploads: uploadClient(uploads) };
   wiki = installFakeWiki({
     sources: {
       "https://files.example/big.bin": bytes(300_000),
@@ -76,81 +72,12 @@ test("writes are refused when disabled, before any download", async () => {
   const off = { ...SETTINGS, allowWrites: false };
   for (const [name, args] of [
     ["put_attachment", { page: "P", name: "a", source_url: "https://files.example/big.bin" }],
-    ["put_attachment_chunk", { page: "P", name: "a", index: 0, content_base64: "AAAA" }],
-    ["finish_attachment_upload", { page: "P", name: "a", upload_id: "0123456789abcdef", chunks: 1 }],
+    ["create_upload_link", { page: "P", name: "a" }],
   ]) {
     assert.match((await call(name, args, off)).error, /WRITES_DISABLED/, name);
   }
   assert.deepEqual(wiki.sourceRequests, []);
   assert.deepEqual(wiki.requests, []);
-});
-
-test("chunked upload: staged off the wiki, written once", async () => {
-  const data = bytes(250_000, 7);
-  const parts = [data.subarray(0, 100_000), data.subarray(100_000, 200_000), data.subarray(200_000)];
-  const first = await call("put_attachment_chunk", { page: "P", name: "f.zip", index: 0, content_base64: b64(parts[0]) });
-  assert.equal(first.error, null);
-  const id = first.out.upload_id;
-  assert.match(id, /^[0-9a-f]{16}$/);
-  for (const i of [2, 1]) { // order doesn't matter
-    assert.equal((await call("put_attachment_chunk", { page: "P", name: "f.zip", index: i, upload_id: id, content_base64: b64(parts[i]) })).error, null);
-  }
-  assert.deepEqual(wiki.requests, []); // nothing reached the wiki yet
-  assert.ok(uploads.objects.get(id).alarm > Date.now() + UPLOAD_TTL_MS - 5000);
-
-  const { error, out } = await call("finish_attachment_upload", { page: "P", name: "f.zip", upload_id: id, chunks: 3, sha256: sha(data).toUpperCase() });
-  assert.equal(error, null);
-  assert.equal(out.size, 250_000);
-  assert.equal(out.sha256, sha(data));
-  assert.deepEqual(wiki.attachments.get("P\u0000f.zip"), data);
-  assert.deepEqual([...wiki.attachments.keys()], ["P\u0000f.zip"]);
-  assert.deepEqual(wiki.requests, ["getAuthToken", "system.multicall"]); // one upload, nothing else
-  assert.equal(uploads.objects.get(id).data.size, 0); // staging cleared
-  assert.match((await call("finish_attachment_upload", { page: "P", name: "f.zip", upload_id: id, chunks: 3 })).error, /UPLOAD_NOT_FOUND/);
-});
-
-test("finish with a missing chunk or wrong checksum keeps the chunks", async () => {
-  const { out } = await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "AAAA" });
-  const id = out.upload_id;
-  await call("put_attachment_chunk", { page: "P", name: "f", index: 2, upload_id: id, content_base64: "BBBB" });
-  const missing = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 3 });
-  assert.match(missing.error, /UPLOAD_INCOMPLETE: chunk 1 of 3/);
-  await call("put_attachment_chunk", { page: "P", name: "f", index: 1, upload_id: id, content_base64: "CCCC" });
-  const bad = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 3, sha256: "a".repeat(64) });
-  assert.match(bad.error, /CHECKSUM_MISMATCH/);
-  const short = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 2 });
-  assert.match(short.error, /chunks 2 were sent too/);
-  assert.equal(wiki.attachments.size, 0);
-
-  const discarded = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 3, discard: true });
-  assert.equal(discarded.out.discarded, 3);
-  assert.equal(uploads.objects.get(id).data.size, 0);
-});
-
-test("an upload is bound to its page and name, capped in size, and expires", async () => {
-  const { out } = await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "AAAA" });
-  const id = out.upload_id;
-  assert.match((await call("put_attachment_chunk", { page: "Q", name: "f", index: 1, upload_id: id, content_base64: "AAAA" })).error, /this upload is for f on P/);
-  assert.match((await call("finish_attachment_upload", { page: "P", name: "g", upload_id: id, chunks: 1 })).error, /this upload is for f on P/);
-  assert.match((await call("put_attachment_chunk", { page: "P", name: "f", index: 1, upload_id: id, content_base64: b64(bytes(1024 * 1024 + 1)) })).error, /a chunk can be at most/);
-  const mib = b64(bytes(1024 * 1024));
-  let err = null;
-  for (let i = 1; i <= 10 && !err; i++) err = (await call("put_attachment_chunk", { page: "P", name: "f", index: i, upload_id: id, content_base64: mib })).error;
-  assert.match(err, /TOO_LARGE: the chunks add up to/);
-  await uploads.objects.get(id).fireAlarm();
-  assert.match((await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 1 })).error, /UPLOAD_NOT_FOUND/);
-});
-
-test("chunk tools explain a missing UPLOADS binding", async () => {
-  const r = await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "AAAA" }, { ...SETTINGS, uploads: null });
-  assert.match(r.error, /UPLOADS_UNAVAILABLE/);
-});
-
-test("chunk arguments are checked", async () => {
-  assert.match((await call("put_attachment_chunk", { page: "P", name: "f", index: 1, content_base64: "AAAA" })).error, /upload_id is required/);
-  assert.match((await call("put_attachment_chunk", { page: "P", name: "f", index: 0, upload_id: "../x", content_base64: "AAAA" })).error, /upload_id must be/);
-  assert.match((await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "" })).error, /must not be empty/);
-  assert.match((await call("finish_attachment_upload", { page: "P", name: "f", upload_id: "nope", chunks: 1 })).error, /upload_id must be/);
 });
 
 test("HTTP 413 from the wiki's web server is explained", async () => {

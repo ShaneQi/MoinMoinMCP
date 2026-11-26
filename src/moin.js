@@ -9,7 +9,7 @@ export class ConfigError extends Error {}
 /** A wiki operation failure, reported to Claude as a tool error. */
 export class WikiError extends Error {}
 
-/** { url, username, password, allowWrites } from the Worker's env; throws ConfigError. */
+/** { url, username, password, allowWrites, uploadSecret } from the Worker's env; throws ConfigError. */
 export function wikiSettings(env) {
   const url = (env.MOIN_URL ?? "").trim();
   endpoint(url);
@@ -20,7 +20,9 @@ export function wikiSettings(env) {
   }
   const writes = String(env.ALLOW_WRITES ?? "false").toLowerCase();
   if (writes !== "true" && writes !== "false") throw new ConfigError("ALLOW_WRITES must be true or false");
-  return { url, username, password, allowWrites: writes === "true" };
+  const uploadSecret = env.UPLOAD_SECRET ?? "";
+  if (uploadSecret && uploadSecret.length < 32) throw new ConfigError("UPLOAD_SECRET must be at least 32 characters");
+  return { url, username, password, allowWrites: writes === "true", uploadSecret };
 }
 
 function parseUrl(url) {
@@ -67,7 +69,7 @@ async function post(url, method, params) {
   try {
     res = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.3" },
+      headers: { "Content-Type": "text/xml", "User-Agent": "moinmoin-mcp/0.4" },
       body: encodeCallBytes(method, params),
       signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
     });

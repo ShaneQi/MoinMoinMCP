@@ -7,20 +7,21 @@ Streamable HTTP at `POST /mcp` and has no dependencies.
 Tools: `check_connection`, `get_page`, `get_page_html`, `get_page_info`,
 `list_pages`, `search_pages`, `recent_changes`, `list_links`, `get_diff`,
 `list_attachments`, `get_attachment`, and the write tools `put_page`,
-`rename_page`, `revert_page`, `put_attachment`, `put_attachment_chunk`,
-`finish_attachment_upload`, `delete_attachment`. Write tools return
+`rename_page`, `revert_page`, `put_attachment`, `create_upload_link`,
+`delete_attachment`. Write tools return
 `WRITES_DISABLED` unless `ALLOW_WRITES=true`.
 
 | File | |
 |---|---|
-| `src/index.js` | Routes, Cloudflare Access check, settings |
+| `src/index.js` | Routes, Cloudflare Access check, settings, `/upload/<token>` |
 | `src/access.js` | Cloudflare Access JWT verification (same file as OFCloudMCP and LinkCliMCP) |
 | `src/mcp.js` | MCP JSON-RPC handling |
 | `src/tools.js` | Tool definitions, argument and result checks |
 | `src/moin.js` | Wiki calls (per-call auth token + `system.multicall`), page URLs |
-| `src/uploads.js` | `UploadStore` Durable Object that stages chunked uploads, and the Worker's client for it |
+| `src/uploadlink.js` | One-time upload links: signed tokens, the `/upload/<token>` endpoint and its page |
+| `src/bytes.js` | SHA-256 and size-capped body reading |
 | `src/xmlrpc.js` | XML-RPC encoder/decoder (requests are built as bytes, base64 written straight in) |
-| `test/` | `node --test`; `fake-wiki.js` is an in-memory MoinMoin xmlrpc2 endpoint installed as `fetch`; `fake-durable-object.js` runs `UploadStore` on in-memory storage |
+| `test/` | `node --test`; `fake-wiki.js` is an in-memory MoinMoin xmlrpc2 endpoint installed as `fetch` |
 
 ## Configuration
 
@@ -35,40 +36,61 @@ Variables and Secrets). `wrangler.toml` keeps them on every deploy
 | `CF_ACCESS_TEAM_DOMAIN` | variable | `<team>.cloudflareaccess.com` |
 | `CF_ACCESS_AUD` | variable | The Access application's AUD tag (comma-separate several) |
 | `MOIN_USER`, `MOIN_PASSWORD` | secrets | Wiki account; leave both unset for an anonymous wiki |
+| `UPLOAD_SECRET` | secret | Signs upload links; at least 32 characters (e.g. `openssl rand -hex 32`). Unset = no upload links |
 
 If the Access or wiki settings are missing or invalid, `/mcp` answers `500`
 instead of opening up. `xmlrpc` must not be in the wiki's `actions_excluded`.
 
 ## Uploading attachments
 
-Attachments can be up to 10 MiB, and there are three ways to send one:
+Three ways, all writing the attachment with one `putAttachment` (one
+`ATTNEW` line in the wiki's edit log):
 
-- **`put_attachment` with `source_url`**: the Worker downloads the file
-  (http/https, no credentials in the URL, 60 s timeout) and uploads it, so the
-  bytes never pass through the conversation. Best for anything that already
-  has a URL.
-- **`put_attachment` with `content_base64`**: the whole file in one call; fine
-  for small files (up to roughly 75 KB). Line-wrapped, URL-safe and unpadded
-  base64 are accepted.
-- **Chunked**: `put_attachment_chunk` for chunk 0 (it returns an `upload_id`),
-  then chunks 1, 2, … with that id (each up to 1 MiB), then
-  `finish_attachment_upload` with the number of chunks. Chunks are staged in a
-  Durable Object (`UploadStore`, one per upload), not on the wiki, so the
-  wiki's edit log and notifications only see the finished attachment: one
-  `ATTNEW`. Finishing joins the chunks, writes the attachment in one
-  `putAttachment` and clears the staging. A missing chunk or a wrong `sha256`
-  writes nothing and keeps the chunks so they can be re-sent; `discard: true`
-  drops them. An upload with no new chunk for an hour is deleted by the
-  object's alarm. An upload is tied to the page and name of its first chunk.
+- **`create_upload_link`** (any local file, up to 20 MiB): returns a one-time
+  `https://<worker>/upload/<token>` link. Claude uploads with
+  `curl --fail-with-body -T <file> '<url>'` from a shell, or gives you the link,
+  which opens an upload page (file picker, drag and drop, progress). The file
+  goes over plain HTTP, so its bytes never pass through the conversation.
+- **`put_attachment` with `source_url`** (up to 20 MiB): the Worker downloads
+  the file (http/https, no credentials in the URL, 60 s timeout).
+- **`put_attachment` with `content_base64`**: the file inside the tool call;
+  only sensible for small files (up to roughly 75 KB). Line-wrapped, URL-safe
+  and unpadded base64 are accepted.
 
-Every upload returns `size` and `sha256`; pass `sha256` to have the content
-checked before anything is written.
+Every upload returns `size` and `sha256`; `put_attachment` takes an expected
+`sha256` and writes nothing if it differs.
 
-Limits outside the Worker: the wiki's web server must accept a request about
-1.4× the file size (nginx defaults to 1 MB, `client_max_body_size`); if it
-refuses, the tool says `TOO_LARGE … HTTP 413`. Encoding a multi-megabyte file
-takes more CPU time than the Workers free plan's 10 ms per request, so large
-uploads need the paid plan.
+### How upload links work
+
+The token is stateless: HMAC-SHA256 with `UPLOAD_SECRET` over the page, the
+attachment name (as MoinMoin will store it), a size cap, an expiry (15 min
+by default, at most 60) and the attachment's state when the link was made:
+absent, or the SHA-256 of its current content. An upload is accepted only
+while the attachment is still in that state, so the first upload uses the
+link up, and so does anyone else attaching that name in the meantime. The
+wiki is the "used" flag; there is no storage. A link for an existing
+attachment needs `overwrite: true`; uploading identical bytes writes nothing
+and leaves the link usable.
+
+`/upload/*` is not behind Cloudflare Access (curl in Claude's sandbox can't
+sign in to Access): in Zero Trust → Access → Applications, add an
+application for `<worker-domain>/upload` with a **Bypass** policy (Everyone).
+The token is the authorization there, so treat a link like a short-lived
+password. `/mcp` keeps requiring Access. The upload page sends
+`Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+
+Responses from `PUT /upload/<token>` are JSON: `200` with `size`, `sha256`
+and the page `url`; `401` invalid or expired link; `409` link already used
+(or the attachment changed); `413` over the link's size cap; `403` writes
+disabled; `503` no `UPLOAD_SECRET`.
+
+### Limits outside the Worker
+
+The wiki's web server must accept a request about 1.4× the file size (nginx
+defaults to 1 MB, `client_max_body_size`); if it refuses, the error says
+`TOO_LARGE … HTTP 413`. Encoding a multi-megabyte file takes more CPU time
+than the Workers free plan's 10 ms per request, so large uploads need the
+paid plan.
 
 ## Authentication
 
@@ -78,7 +100,8 @@ also verifies the Access JWT itself on every `/mcp` request, from
 `https://<team>/cdn-cgi/access/certs`, issuer, audience, and `exp`/`nbf` with
 60 s leeway. A missing or invalid token gets `401`; the reason is only logged,
 as `access denied: …`. The `workers.dev` and preview URLs are off
-(`wrangler.toml`), so the custom domain behind Access is the only way in. `/health` and `/healthz` stay open.
+(`wrangler.toml`), so the custom domain behind Access is the only way in. `/health` and `/healthz` stay open,
+and `/upload/<token>` is authorized by its signed token instead (see above).
 
 ## Develop
 
@@ -93,6 +116,4 @@ Every push to `main` runs the tests, then deploys with `wrangler deploy`
 `CLOUDFLARE_API_TOKEN` (the "Edit Cloudflare Workers" template) and
 `CLOUDFLARE_ACCOUNT_ID`. A deploy only replaces the code: variables and
 secrets stay (`keep_bindings`), the custom domain is managed in the dashboard,
-and `workers.dev` and preview URLs stay off. The `UPLOADS` Durable Object binding and its
-migration are in `wrangler.toml` (`keep_bindings` doesn't cover Durable
-Objects); the first deploy with it creates the `UploadStore` namespace.
+and `workers.dev` and preview URLs stay off.

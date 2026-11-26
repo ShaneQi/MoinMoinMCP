@@ -2,7 +2,8 @@
 // Python server, so Claude sees no difference.
 import { callWiki, pageUrl, WikiError } from "./moin.js";
 import { base64ToBytes, bytesToBase64, XmlRpcDateTime } from "./xmlrpc.js";
-import { MAX_UPLOAD_BYTES } from "./uploads.js";
+import { BodyError, readCapped, sha256Hex } from "./bytes.js";
+import { createUploadLink, LinkError, LINK_DEFAULT_MINUTES, LINK_MAX_BYTES, LINK_MAX_MINUTES } from "./uploadlink.js";
 
 /** A tool failure, reported to Claude as the tool's error text. */
 export class ToolError extends Error {}
@@ -79,10 +80,8 @@ function jsonable(v) {
 
 // Whole file, however it arrives. A Worker has 128 MB; an upload holds the
 // file about twice plus its base64 request body, so this leaves headroom.
-export const MAX_ATTACHMENT_BYTES = MAX_UPLOAD_BYTES;
-export const MAX_CHUNKS = 1000;
+export const MAX_ATTACHMENT_BYTES = LINK_MAX_BYTES;
 const SOURCE_TIMEOUT_MS = 60_000;
-const UPLOAD_ID_RE = /^[0-9a-f]{16}$/;
 const SHA256_RE = /^[0-9a-fA-F]{64}$/;
 
 const mib = (n) => `${Math.round((n / 1024 / 1024) * 10) / 10} MiB`;
@@ -103,11 +102,6 @@ export function decodeBase64Arg(name, value) {
   } catch {
     throw new ToolError(`INVALID_ATTACHMENT: ${name} must be valid base64`);
   }
-}
-
-async function sha256Hex(bytes) {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function checkSha256(arg) {
@@ -135,68 +129,22 @@ async function fetchSource(source) {
   }
   let res;
   try {
-    res = await fetch(u, { headers: { "User-Agent": "moinmoin-mcp/0.3" }, signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS) });
+    res = await fetch(u, { headers: { "User-Agent": "moinmoin-mcp/0.4" }, signal: AbortSignal.timeout(SOURCE_TIMEOUT_MS) });
   } catch (e) {
     throw new ToolError(`SOURCE_FAILED: could not download source_url (${e?.name === "TimeoutError" ? "timed out" : e?.message ?? e})`);
   }
   if (!res.ok) throw new ToolError(`SOURCE_FAILED: source_url answered HTTP ${res.status}`);
-  const declared = Number(res.headers.get("Content-Length"));
-  if (declared > MAX_ATTACHMENT_BYTES) {
-    await res.body?.cancel();
-    throw tooLarge(declared);
+  try {
+    return await readCapped(res.body, {
+      length: res.headers.get("Content-Length"),
+      exact: !res.headers.get("Content-Encoding"), // a compressed size says nothing about the bytes delivered
+      max: MAX_ATTACHMENT_BYTES,
+    });
+  } catch (e) {
+    if (!(e instanceof BodyError)) throw e;
+    if (e.kind === "too_large") throw tooLarge(e.size);
+    throw new ToolError(`SOURCE_FAILED: download of source_url ${e.kind === "short" ? "ended early" : "broke off"} (${e.message})`);
   }
-  // With a Content-Length for the bytes as delivered (not a compressed size),
-  // read straight into one buffer; otherwise collect and join.
-  const exact = !res.headers.get("Content-Encoding") && Number.isInteger(declared) && declared > 0;
-  const known = exact ? new Uint8Array(declared) : null;
-  const parts = [];
-  let size = 0;
-  if (!res.body) return new Uint8Array(0);
-  const reader = res.body.getReader();
-  for (;;) {
-    let step;
-    try {
-      step = await reader.read();
-    } catch (e) {
-      throw new ToolError(`SOURCE_FAILED: download of source_url broke off (${e?.message ?? e})`);
-    }
-    if (step.done) break;
-    size += step.value.length;
-    if (size > MAX_ATTACHMENT_BYTES) {
-      await reader.cancel();
-      throw tooLarge(size);
-    }
-    if (known && size <= known.length) known.set(step.value, size - step.value.length);
-    else parts.push(step.value);
-  }
-  if (known && !parts.length && size === known.length) return known;
-  if (known) throw new ToolError(`SOURCE_FAILED: source_url sent ${size} bytes, not the ${declared} it announced`);
-  return concat(parts, size);
-}
-
-function concat(parts, size = parts.reduce((n, p) => n + p.length, 0)) {
-  const out = new Uint8Array(size);
-  let at = 0;
-  for (const p of parts) {
-    out.set(p, at);
-    at += p.length;
-  }
-  return out;
-}
-
-function checkUploadId(uploadId) {
-  if (!UPLOAD_ID_RE.test(uploadId ?? "")) {
-    throw new ToolError("INVALID_ARGUMENTS: upload_id must be the upload_id returned by put_attachment_chunk for chunk 0");
-  }
-}
-
-const newUploadId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
-
-function requireUploads(ctx) {
-  if (!ctx.settings.uploads) {
-    throw new ToolError("UPLOADS_UNAVAILABLE: chunked uploads need the UPLOADS Durable Object binding; use put_attachment with source_url or content_base64");
-  }
-  return ctx.settings.uploads;
 }
 
 // ---------- tools ----------
@@ -314,8 +262,8 @@ export const TOOLS = [
 
   tool("put_attachment",
     "Upload an attachment in one call, from content_base64 or from source_url (the server downloads it, so the " +
-    "bytes never pass through the conversation; prefer it whenever the file is reachable at a URL). For a file " +
-    "over about 75 KB that has no URL, use put_attachment_chunk and finish_attachment_upload instead. " +
+    "bytes never pass through the conversation; prefer it whenever the file is reachable at a URL). For a local " +
+    "file over about 75 KB, use create_upload_link instead. " +
     `Limit ${mib(MAX_ATTACHMENT_BYTES)}. Give sha256 to have the content checked before it is written. ` +
     "May overwrite an existing attachment.",
     {
@@ -342,71 +290,34 @@ export const TOOLS = [
       return { ...(await ctx.write("putAttachment", args.page, args.name, data)), name: args.name, size: data.length, sha256 };
     }),
 
-  tool("put_attachment_chunk",
-    "Stage one chunk of a large attachment upload. Split the file's bytes into consecutive chunks (about 75 KB, " +
-    "i.e. 100,000 base64 characters, each; at most 1 MiB), send chunk 0 without upload_id, then chunks 1, 2, ... " +
-    "with the upload_id it returns, and call finish_attachment_upload. Chunks are held by the server, not the " +
-    "wiki, and an upload with no new chunk for an hour is deleted. A chunk can be re-sent.",
+  tool("create_upload_link",
+    "Make a one-time link for uploading a file as an attachment over plain HTTP, so its bytes never pass " +
+    "through the conversation. With a shell, upload it yourself with the returned curl command " +
+    "(curl --fail-with-body -T <file> '<url>'); otherwise give the user the link: it opens an upload page in the " +
+    "browser. The link works once, for this page and name, until it expires; the upload's result has its size " +
+    "and sha256. Refuses if the attachment exists, unless overwrite is true.",
     {
-      page, name: str("Final attachment file name"),
-      index: { type: "integer", minimum: 0, maximum: MAX_CHUNKS - 1, description: "0 for the first chunk" },
-      content_base64: str("This chunk's bytes as base64"),
-      upload_id: { anyOf: [{ type: "string" }, { type: "null" }], default: null,
-        description: "From the chunk-0 result; omit for chunk 0 to start a new upload" },
+      page, name: str("Attachment file name"),
+      overwrite: { type: "boolean", default: false, description: "Allow replacing an existing attachment" },
+      expires_minutes: { type: "integer", minimum: 1, maximum: LINK_MAX_MINUTES, default: LINK_DEFAULT_MINUTES },
+      max_bytes: { type: "integer", minimum: 1, maximum: LINK_MAX_BYTES, default: LINK_MAX_BYTES },
     },
-    ["page", "name", "index", "content_base64"], WRITE,
+    ["page", "name"], WRITE,
     async ({ args, ctx }) => {
       ctx.requireWrites();
-      const uploads = requireUploads(ctx);
-      let uploadId = args.upload_id;
-      if (uploadId === null) {
-        if (args.index !== 0) throw new ToolError("INVALID_ARGUMENTS: upload_id is required for chunks after chunk 0");
-        uploadId = newUploadId();
-      } else {
-        checkUploadId(uploadId);
+      if (!ctx.settings.uploadSecret || !ctx.settings.origin) {
+        throw new ToolError("UPLOAD_LINKS_UNAVAILABLE: set the UPLOAD_SECRET secret on the server to enable upload links");
       }
-      const data = decodeBase64Arg("content_base64", args.content_base64);
-      if (!data.length) throw new ToolError("INVALID_ATTACHMENT: a chunk must not be empty");
-      const r = await uploads.put(uploadId, args.index, data, args.page, args.name);
-      if (r.error) throw new ToolError(r.error);
-      return { ok: true, ...ctx.details(args.page), name: args.name, upload_id: uploadId, index: args.index, size: r.size, received: r.total };
-    }),
-
-  tool("finish_attachment_upload",
-    "Join the chunks staged with put_attachment_chunk (0 to chunks-1) into the attachment, check the size limit " +
-    "and the optional sha256, and write it to the wiki in one upload (may overwrite an existing attachment). " +
-    "If a chunk is missing or the checksum differs, nothing is written and the chunks are kept, so missing ones " +
-    "can be re-sent. discard: true drops the upload without writing anything.",
-    {
-      page, name: str(), upload_id: str(),
-      chunks: { type: "integer", minimum: 1, maximum: MAX_CHUNKS, description: "Number of chunks sent" },
-      sha256: { anyOf: [{ type: "string" }, { type: "null" }], default: null,
-        description: "Expected SHA-256 of the whole file (hex)" },
-      discard: { type: "boolean", default: false },
-    },
-    ["page", "name", "upload_id", "chunks"], WRITE,
-    async ({ args, ctx }) => {
-      ctx.requireWrites();
-      const uploads = requireUploads(ctx);
-      checkUploadId(args.upload_id);
-      checkSha256(args.sha256);
-      if (args.discard) {
-        const r = await uploads.discard(args.upload_id);
-        return { ok: true, ...ctx.details(args.page), discarded: r.chunks };
+      if (!args.name.trim()) throw new ToolError("INVALID_ARGUMENTS: name must not be empty");
+      try {
+        return await createUploadLink(ctx.settings, {
+          page: args.page, name: args.name, overwrite: args.overwrite,
+          minutes: args.expires_minutes, maxBytes: args.max_bytes,
+        }, ctx.call);
+      } catch (e) {
+        if (e instanceof LinkError) throw new ToolError(e.message);
+        throw e;
       }
-      const r = await uploads.join(args.upload_id, args.chunks, args.page, args.name);
-      if (r.expired) throw new ToolError("UPLOAD_NOT_FOUND: no chunks for this upload_id (finished, discarded, or expired after an hour); start again from chunk 0");
-      if (r.missing) {
-        throw new ToolError(`UPLOAD_INCOMPLETE: chunk${r.missing.length > 1 ? "s" : ""} ${r.missing.join(", ")} of ${args.chunks} ` +
-          "not received; re-send with put_attachment_chunk and finish again. Nothing was written");
-      }
-      if (r.error) throw new ToolError(r.error);
-      const data = r.data;
-      if (data.length > MAX_ATTACHMENT_BYTES) throw tooLarge(data.length);
-      const sha256 = await verifySha256(data, args.sha256);
-      const written = await ctx.write("putAttachment", args.page, args.name, data);
-      await uploads.discard(args.upload_id);
-      return { ...written, name: args.name, size: data.length, sha256, chunks: args.chunks };
     }),
 
   tool("delete_attachment", "Delete a page attachment. Confirm this change with the user first.",
@@ -428,6 +339,7 @@ function byCodePoint(a, b) {
 export async function runTool(t, rawArgs, settings, call = callWiki) {
   const ctx = {
     settings,
+    call,
     details: (p, version) => ({ page: p, url: pageUrl(settings.url, p, version) }),
     async rpc(check, method, ...params) {
       const result = jsonable(await call(settings, method, params));
