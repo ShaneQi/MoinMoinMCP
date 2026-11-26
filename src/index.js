@@ -3,6 +3,9 @@
 import { accessConfig, accessToken, verifyAccessJwt } from "./access.js";
 import { handleMcp } from "./mcp.js";
 import { ConfigError, wikiSettings } from "./moin.js";
+import { uploadClient } from "./uploads.js";
+
+export { UploadStore } from "./uploads.js";
 
 const unauthorized = () =>
   new Response("Unauthorized\n", { status: 401, headers: { "WWW-Authenticate": "Bearer" } });
@@ -41,6 +44,7 @@ export default {
       console.error(`configuration error: ${e.message}`);
       return new Response(`Server configuration error: ${e.message}\n`, { status: 500 });
     }
+    settings.uploads = env.UPLOADS ? uploadClient(env.UPLOADS) : null;
     return handleMcp(request, settings);
   },
 };

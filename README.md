@@ -18,8 +18,9 @@ Tools: `check_connection`, `get_page`, `get_page_html`, `get_page_info`,
 | `src/mcp.js` | MCP JSON-RPC handling |
 | `src/tools.js` | Tool definitions, argument and result checks |
 | `src/moin.js` | Wiki calls (per-call auth token + `system.multicall`), page URLs |
+| `src/uploads.js` | `UploadStore` Durable Object that stages chunked uploads, and the Worker's client for it |
 | `src/xmlrpc.js` | XML-RPC encoder/decoder (requests are built as bytes, base64 written straight in) |
-| `test/` | `node --test`; `fake-wiki.js` is an in-memory MoinMoin xmlrpc2 endpoint installed as `fetch` |
+| `test/` | `node --test`; `fake-wiki.js` is an in-memory MoinMoin xmlrpc2 endpoint installed as `fetch`; `fake-durable-object.js` runs `UploadStore` on in-memory storage |
 
 ## Configuration
 
@@ -50,13 +51,15 @@ Attachments can be up to 10 MiB, and there are three ways to send one:
   for small files (up to roughly 75 KB). Line-wrapped, URL-safe and unpadded
   base64 are accepted.
 - **Chunked**: `put_attachment_chunk` for chunk 0 (it returns an `upload_id`),
-  then chunks 1, 2, … with that id, then `finish_attachment_upload` with the
-  number of chunks. Each chunk is staged on the page as a temporary attachment
-  `<name>.upload-<id>-<nnnn>.part`; finishing reads them back (32 per
-  multicall, one auth token), joins them, writes the attachment and deletes
-  the parts. A missing chunk or a wrong `sha256` writes nothing and keeps the
-  parts so they can be re-sent; `discard: true` removes them. Parts of an
-  upload that was never finished stay on the page until deleted.
+  then chunks 1, 2, … with that id (each up to 1 MiB), then
+  `finish_attachment_upload` with the number of chunks. Chunks are staged in a
+  Durable Object (`UploadStore`, one per upload), not on the wiki, so the
+  wiki's edit log and notifications only see the finished attachment: one
+  `ATTNEW`. Finishing joins the chunks, writes the attachment in one
+  `putAttachment` and clears the staging. A missing chunk or a wrong `sha256`
+  writes nothing and keeps the chunks so they can be re-sent; `discard: true`
+  drops them. An upload with no new chunk for an hour is deleted by the
+  object's alarm. An upload is tied to the page and name of its first chunk.
 
 Every upload returns `size` and `sha256`; pass `sha256` to have the content
 checked before anything is written.
@@ -90,4 +93,6 @@ Every push to `main` runs the tests, then deploys with `wrangler deploy`
 `CLOUDFLARE_API_TOKEN` (the "Edit Cloudflare Workers" template) and
 `CLOUDFLARE_ACCOUNT_ID`. A deploy only replaces the code: variables and
 secrets stay (`keep_bindings`), the custom domain is managed in the dashboard,
-and `workers.dev` and preview URLs stay off.
+and `workers.dev` and preview URLs stay off. The `UPLOADS` Durable Object binding and its
+migration are in `wrangler.toml` (`keep_bindings` doesn't cover Durable
+Objects); the first deploy with it creates the `UploadStore` namespace.

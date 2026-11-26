@@ -14,3 +14,14 @@ preview_urls = false
 # keep the existing bindings of these types, so a deploy only replaces the code.
 [unsafe.metadata]
 keep_bindings = ["plain_text", "json", "secret_text", "secret_key"]
+
+# Chunked attachment uploads are staged in a Durable Object (src/uploads.js),
+# one object per upload, so chunks never reach the wiki. Durable Object
+# bindings aren't covered by keep_bindings, so this one lives here.
+[[durable_objects.bindings]]
+name = "UPLOADS"
+class_name = "UploadStore"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UploadStore"]

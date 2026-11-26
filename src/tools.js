@@ -1,7 +1,8 @@
 // The MCP tools. Names, arguments, results and error codes match the earlier
 // Python server, so Claude sees no difference.
-import { callWiki, callWikiBatch, pageUrl, WikiError } from "./moin.js";
+import { callWiki, pageUrl, WikiError } from "./moin.js";
 import { base64ToBytes, bytesToBase64, XmlRpcDateTime } from "./xmlrpc.js";
+import { MAX_UPLOAD_BYTES } from "./uploads.js";
 
 /** A tool failure, reported to Claude as the tool's error text. */
 export class ToolError extends Error {}
@@ -78,8 +79,7 @@ function jsonable(v) {
 
 // Whole file, however it arrives. A Worker has 128 MB; an upload holds the
 // file about twice plus its base64 request body, so this leaves headroom.
-export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
-const READ_GROUP = 32; // chunks read back per multicall in finish_attachment_upload
+export const MAX_ATTACHMENT_BYTES = MAX_UPLOAD_BYTES;
 export const MAX_CHUNKS = 1000;
 const SOURCE_TIMEOUT_MS = 60_000;
 const UPLOAD_ID_RE = /^[0-9a-f]{16}$/;
@@ -184,9 +184,6 @@ function concat(parts, size = parts.reduce((n, p) => n + p.length, 0)) {
   return out;
 }
 
-/** The staging attachment that holds one chunk of an upload. */
-export const chunkName = (name, uploadId, index) => `${name}.upload-${uploadId}-${String(index).padStart(4, "0")}.part`;
-
 function checkUploadId(uploadId) {
   if (!UPLOAD_ID_RE.test(uploadId ?? "")) {
     throw new ToolError("INVALID_ARGUMENTS: upload_id must be the upload_id returned by put_attachment_chunk for chunk 0");
@@ -195,10 +192,11 @@ function checkUploadId(uploadId) {
 
 const newUploadId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
 
-async function deleteChunks(ctx, page, name, uploadId, chunks) {
-  const names = Array.from({ length: chunks }, (_, i) => chunkName(name, uploadId, i));
-  const results = await ctx.batch(names.map((n) => ["deleteAttachment", page, n]), MAX_CHUNKS);
-  return names.filter((_, i) => results[i].value !== true);
+function requireUploads(ctx) {
+  if (!ctx.settings.uploads) {
+    throw new ToolError("UPLOADS_UNAVAILABLE: chunked uploads need the UPLOADS Durable Object binding; use put_attachment with source_url or content_base64");
+  }
+  return ctx.settings.uploads;
 }
 
 // ---------- tools ----------
@@ -346,9 +344,9 @@ export const TOOLS = [
 
   tool("put_attachment_chunk",
     "Stage one chunk of a large attachment upload. Split the file's bytes into consecutive chunks (about 75 KB, " +
-    "i.e. 100,000 base64 characters, each), send chunk 0 without upload_id, then send chunks 1, 2, ... with the " +
-    "upload_id it returns, and call finish_attachment_upload. Chunks are kept on the page as temporary " +
-    "'<name>.upload-<id>-<n>.part' attachments until the upload is finished or discarded. A chunk can be re-sent.",
+    "i.e. 100,000 base64 characters, each; at most 1 MiB), send chunk 0 without upload_id, then chunks 1, 2, ... " +
+    "with the upload_id it returns, and call finish_attachment_upload. Chunks are held by the server, not the " +
+    "wiki, and an upload with no new chunk for an hour is deleted. A chunk can be re-sent.",
     {
       page, name: str("Final attachment file name"),
       index: { type: "integer", minimum: 0, maximum: MAX_CHUNKS - 1, description: "0 for the first chunk" },
@@ -359,6 +357,7 @@ export const TOOLS = [
     ["page", "name", "index", "content_base64"], WRITE,
     async ({ args, ctx }) => {
       ctx.requireWrites();
+      const uploads = requireUploads(ctx);
       let uploadId = args.upload_id;
       if (uploadId === null) {
         if (args.index !== 0) throw new ToolError("INVALID_ARGUMENTS: upload_id is required for chunks after chunk 0");
@@ -368,15 +367,16 @@ export const TOOLS = [
       }
       const data = decodeBase64Arg("content_base64", args.content_base64);
       if (!data.length) throw new ToolError("INVALID_ATTACHMENT: a chunk must not be empty");
-      await ctx.write("putAttachment", args.page, chunkName(args.name, uploadId, args.index), data);
-      return { ok: true, ...ctx.details(args.page), name: args.name, upload_id: uploadId, index: args.index, size: data.length };
+      const r = await uploads.put(uploadId, args.index, data, args.page, args.name);
+      if (r.error) throw new ToolError(r.error);
+      return { ok: true, ...ctx.details(args.page), name: args.name, upload_id: uploadId, index: args.index, size: r.size, received: r.total };
     }),
 
   tool("finish_attachment_upload",
     "Join the chunks staged with put_attachment_chunk (0 to chunks-1) into the attachment, check the size limit " +
-    "and the optional sha256, write it (may overwrite an existing attachment) and remove the chunks. " +
+    "and the optional sha256, and write it to the wiki in one upload (may overwrite an existing attachment). " +
     "If a chunk is missing or the checksum differs, nothing is written and the chunks are kept, so missing ones " +
-    "can be re-sent. discard: true removes the chunks without writing anything.",
+    "can be re-sent. discard: true drops the upload without writing anything.",
     {
       page, name: str(), upload_id: str(),
       chunks: { type: "integer", minimum: 1, maximum: MAX_CHUNKS, description: "Number of chunks sent" },
@@ -387,26 +387,26 @@ export const TOOLS = [
     ["page", "name", "upload_id", "chunks"], WRITE,
     async ({ args, ctx }) => {
       ctx.requireWrites();
+      const uploads = requireUploads(ctx);
       checkUploadId(args.upload_id);
       checkSha256(args.sha256);
       if (args.discard) {
-        const left = await deleteChunks(ctx, args.page, args.name, args.upload_id, args.chunks);
-        return { ok: true, ...ctx.details(args.page), discarded: args.chunks - left.length, ...(left.length && { not_removed: left }) };
+        const r = await uploads.discard(args.upload_id);
+        return { ok: true, ...ctx.details(args.page), discarded: r.chunks };
       }
-      const results = await ctx.batch(Array.from({ length: args.chunks },
-        (_, i) => ["getAttachment", args.page, chunkName(args.name, args.upload_id, i)]), READ_GROUP);
-      const missing = results.flatMap((r, i) => (r.value instanceof Uint8Array ? [] : [i]));
-      if (missing.length) {
-        throw new ToolError(`UPLOAD_INCOMPLETE: chunk${missing.length > 1 ? "s" : ""} ${missing.join(", ")} of ${args.chunks} ` +
-          "not found; re-send with put_attachment_chunk and finish again. Nothing was written");
+      const r = await uploads.join(args.upload_id, args.chunks, args.page, args.name);
+      if (r.expired) throw new ToolError("UPLOAD_NOT_FOUND: no chunks for this upload_id (finished, discarded, or expired after an hour); start again from chunk 0");
+      if (r.missing) {
+        throw new ToolError(`UPLOAD_INCOMPLETE: chunk${r.missing.length > 1 ? "s" : ""} ${r.missing.join(", ")} of ${args.chunks} ` +
+          "not received; re-send with put_attachment_chunk and finish again. Nothing was written");
       }
-      const size = results.reduce((n, r) => n + r.value.length, 0);
-      if (size > MAX_ATTACHMENT_BYTES) throw tooLarge(size);
-      const data = concat(results.map((r) => r.value), size);
+      if (r.error) throw new ToolError(r.error);
+      const data = r.data;
+      if (data.length > MAX_ATTACHMENT_BYTES) throw tooLarge(data.length);
       const sha256 = await verifySha256(data, args.sha256);
       const written = await ctx.write("putAttachment", args.page, args.name, data);
-      const left = await deleteChunks(ctx, args.page, args.name, args.upload_id, args.chunks);
-      return { ...written, name: args.name, size, sha256, chunks: args.chunks, ...(left.length && { chunks_not_removed: left }) };
+      await uploads.discard(args.upload_id);
+      return { ...written, name: args.name, size: data.length, sha256, chunks: args.chunks };
     }),
 
   tool("delete_attachment", "Delete a page attachment. Confirm this change with the user first.",
@@ -425,13 +425,9 @@ function byCodePoint(a, b) {
 }
 
 /** Runs a tool; returns an MCP CallToolResult. */
-export async function runTool(t, rawArgs, settings, call = callWiki, batch = callWikiBatch) {
+export async function runTool(t, rawArgs, settings, call = callWiki) {
   const ctx = {
     settings,
-    /** Several calls in one multicall; each result is { value } or { error }. Values are not shape-checked. */
-    async batch(calls, groupSize) {
-      return (await batch(settings, calls, groupSize)).map((r) => ("value" in r ? { value: jsonable(r.value) } : r));
-    },
     details: (p, version) => ({ page: p, url: pageUrl(settings.url, p, version) }),
     async rpc(check, method, ...params) {
       const result = jsonable(await call(settings, method, params));

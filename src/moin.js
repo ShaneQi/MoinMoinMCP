@@ -108,40 +108,6 @@ async function authToken(url, settings) {
 }
 
 /**
- * Calls several wiki methods through system.multicall, `groupSize` calls per
- * request, all with one auth token. A tool can then touch many attachments
- * without running into the Worker's subrequest limit, and a group bounds how
- * much one response holds. Returns, per call, { value } or { error } (a
- * WikiError); one failing call does not stop the others.
- */
-export async function callWikiBatch(settings, calls, groupSize = 100) {
-  if (!calls.length) return [];
-  const url = endpoint(settings.url);
-  const token = settings.username ? await authToken(url, settings) : null;
-  const out = [];
-  for (let i = 0; i < calls.length; i += groupSize) {
-    const entries = calls.slice(i, i + groupSize).map(([methodName, ...params]) => ({ methodName, params }));
-    const auth = token ? [{ methodName: "applyAuthToken", params: [token] }] : [];
-    const results = await post(url, "system.multicall", [[...auth, ...entries]]);
-    if (!Array.isArray(results) || results.length !== auth.length + entries.length) {
-      throw new WikiError("NOT_XMLRPC: unexpected multicall result from the wiki");
-    }
-    if (auth.length && multicallResult(results[0]) !== "SUCCESS") {
-      throw new WikiError("AUTH_FAILED: wiki rejected the authentication token");
-    }
-    for (const entry of results.slice(auth.length)) {
-      try {
-        out.push({ value: multicallResult(entry) });
-      } catch (e) {
-        if (!(e instanceof WikiError)) throw e;
-        out.push({ error: e });
-      }
-    }
-  }
-  return out;
-}
-
-/**
  * Calls one wiki method. With credentials, it gets a fresh auth token and sends
  * applyAuthToken + the call as one system.multicall, as Moin's xmlrpc2 expects.
  */

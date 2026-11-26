@@ -1,10 +1,12 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { TOOLS, runTool, chunkName, decodeBase64Arg, MAX_ATTACHMENT_BYTES } from "../src/tools.js";
+import { TOOLS, runTool, decodeBase64Arg, MAX_ATTACHMENT_BYTES } from "../src/tools.js";
+import { uploadClient, UPLOAD_TTL_MS } from "../src/uploads.js";
 import { installFakeWiki, WIKI } from "./fake-wiki.js";
+import { fakeNamespace } from "./fake-durable-object.js";
 
-const SETTINGS = { url: WIKI, username: "bot", password: "pw", allowWrites: true };
+let SETTINGS, uploads;
 const tool = (name) => TOOLS.find((t) => t.name === name);
 async function call(name, args, settings = SETTINGS) {
   const r = await runTool(tool(name), args, settings);
@@ -16,6 +18,8 @@ const b64 = (b) => Buffer.from(b).toString("base64");
 
 let wiki;
 beforeEach(() => {
+  uploads = fakeNamespace();
+  SETTINGS = { url: WIKI, username: "bot", password: "pw", allowWrites: true, uploads: uploadClient(uploads) };
   wiki = installFakeWiki({
     sources: {
       "https://files.example/big.bin": bytes(300_000),
@@ -81,7 +85,7 @@ test("writes are refused when disabled, before any download", async () => {
   assert.deepEqual(wiki.requests, []);
 });
 
-test("chunked upload: stage, finish, verify, clean up", async () => {
+test("chunked upload: staged off the wiki, written once", async () => {
   const data = bytes(250_000, 7);
   const parts = [data.subarray(0, 100_000), data.subarray(100_000, 200_000), data.subarray(200_000)];
   const first = await call("put_attachment_chunk", { page: "P", name: "f.zip", index: 0, content_base64: b64(parts[0]) });
@@ -91,17 +95,18 @@ test("chunked upload: stage, finish, verify, clean up", async () => {
   for (const i of [2, 1]) { // order doesn't matter
     assert.equal((await call("put_attachment_chunk", { page: "P", name: "f.zip", index: i, upload_id: id, content_base64: b64(parts[i]) })).error, null);
   }
-  assert.ok(wiki.attachments.has(`P\u0000${chunkName("f.zip", id, 2)}`));
+  assert.deepEqual(wiki.requests, []); // nothing reached the wiki yet
+  assert.ok(uploads.objects.get(id).alarm > Date.now() + UPLOAD_TTL_MS - 5000);
 
-  wiki.requests.length = 0;
   const { error, out } = await call("finish_attachment_upload", { page: "P", name: "f.zip", upload_id: id, chunks: 3, sha256: sha(data).toUpperCase() });
   assert.equal(error, null);
   assert.equal(out.size, 250_000);
   assert.equal(out.sha256, sha(data));
   assert.deepEqual(wiki.attachments.get("P\u0000f.zip"), data);
-  assert.deepEqual([...wiki.attachments.keys()], ["P\u0000f.zip"]); // chunks removed
-  // read all chunks, write, delete all chunks: 3 multicalls, each with its own auth token
-  assert.deepEqual(wiki.requests, ["getAuthToken", "system.multicall", "getAuthToken", "system.multicall", "getAuthToken", "system.multicall"]);
+  assert.deepEqual([...wiki.attachments.keys()], ["P\u0000f.zip"]);
+  assert.deepEqual(wiki.requests, ["getAuthToken", "system.multicall"]); // one upload, nothing else
+  assert.equal(uploads.objects.get(id).data.size, 0); // staging cleared
+  assert.match((await call("finish_attachment_upload", { page: "P", name: "f.zip", upload_id: id, chunks: 3 })).error, /UPLOAD_NOT_FOUND/);
 });
 
 test("finish with a missing chunk or wrong checksum keeps the chunks", async () => {
@@ -113,12 +118,32 @@ test("finish with a missing chunk or wrong checksum keeps the chunks", async () 
   await call("put_attachment_chunk", { page: "P", name: "f", index: 1, upload_id: id, content_base64: "CCCC" });
   const bad = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 3, sha256: "a".repeat(64) });
   assert.match(bad.error, /CHECKSUM_MISMATCH/);
-  assert.equal(wiki.attachments.has("P\u0000f"), false);
-  assert.equal(wiki.attachments.size, 3);
+  const short = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 2 });
+  assert.match(short.error, /chunks 2 were sent too/);
+  assert.equal(wiki.attachments.size, 0);
 
   const discarded = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 3, discard: true });
   assert.equal(discarded.out.discarded, 3);
-  assert.equal(wiki.attachments.size, 0);
+  assert.equal(uploads.objects.get(id).data.size, 0);
+});
+
+test("an upload is bound to its page and name, capped in size, and expires", async () => {
+  const { out } = await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "AAAA" });
+  const id = out.upload_id;
+  assert.match((await call("put_attachment_chunk", { page: "Q", name: "f", index: 1, upload_id: id, content_base64: "AAAA" })).error, /this upload is for f on P/);
+  assert.match((await call("finish_attachment_upload", { page: "P", name: "g", upload_id: id, chunks: 1 })).error, /this upload is for f on P/);
+  assert.match((await call("put_attachment_chunk", { page: "P", name: "f", index: 1, upload_id: id, content_base64: b64(bytes(1024 * 1024 + 1)) })).error, /a chunk can be at most/);
+  const mib = b64(bytes(1024 * 1024));
+  let err = null;
+  for (let i = 1; i <= 10 && !err; i++) err = (await call("put_attachment_chunk", { page: "P", name: "f", index: i, upload_id: id, content_base64: mib })).error;
+  assert.match(err, /TOO_LARGE: the chunks add up to/);
+  await uploads.objects.get(id).fireAlarm();
+  assert.match((await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 1 })).error, /UPLOAD_NOT_FOUND/);
+});
+
+test("chunk tools explain a missing UPLOADS binding", async () => {
+  const r = await call("put_attachment_chunk", { page: "P", name: "f", index: 0, content_base64: "AAAA" }, { ...SETTINGS, uploads: null });
+  assert.match(r.error, /UPLOADS_UNAVAILABLE/);
 });
 
 test("chunk arguments are checked", async () => {
@@ -132,14 +157,6 @@ test("HTTP 413 from the wiki's web server is explained", async () => {
   installFakeWiki({ maxBody: 10_000 });
   const { error } = await call("put_attachment", { page: "P", name: "a", content_base64: b64(bytes(20_000)) });
   assert.match(error, /TOO_LARGE: .*HTTP 413.*client_max_body_size/);
-});
-
-test("anonymous wiki: batches go without an auth token", async () => {
-  const anon = { ...SETTINGS, username: "", password: "" };
-  // the fake wiki refuses unauthenticated multicall writes, so just check discard's request shape
-  wiki.requests.length = 0;
-  await call("finish_attachment_upload", { page: "P", name: "f", upload_id: "0123456789abcdef", chunks: 2, discard: true }, anon);
-  assert.deepEqual(wiki.requests, ["system.multicall"]);
 });
 
 test("encodeCallBytes matches encodeCall", async () => {
@@ -179,14 +196,3 @@ test("base64ToBytes is strict and matches Buffer", async () => {
   for (const bad of ["A", "AAA", "A===", "AA=A", "AA AA", "AAAé"]) assert.throws(() => base64ToBytes(bad), TypeError, bad);
 });
 
-test("finish reads many chunks in groups with one auth token", async () => {
-  const id = "0123456789abcdef";
-  const data = bytes(100 * 50, 3);
-  for (let i = 0; i < 100; i++) wiki.attachments.set(`P\u0000${chunkName("f", id, i)}`, data.subarray(i * 50, (i + 1) * 50));
-  wiki.requests.length = 0;
-  const { error, out } = await call("finish_attachment_upload", { page: "P", name: "f", upload_id: id, chunks: 100 });
-  assert.equal(error, null);
-  assert.equal(out.sha256, sha(data));
-  // reads: 1 token + 4 groups of up to 32; write: token + multicall; deletes: token + 1 multicall
-  assert.deepEqual(wiki.requests, ["getAuthToken", ...Array(4).fill("system.multicall"), "getAuthToken", "system.multicall", "getAuthToken", "system.multicall"]);
-});
