@@ -36,7 +36,7 @@ Variables and Secrets). `wrangler.toml` keeps them on every deploy
 | `CF_ACCESS_TEAM_DOMAIN` | variable | `<team>.cloudflareaccess.com` |
 | `CF_ACCESS_AUD` | variable | The Access application's AUD tag (comma-separate several) |
 | `MOIN_USER`, `MOIN_PASSWORD` | secrets | Wiki account; leave both unset for an anonymous wiki |
-| `UPLOAD_SECRET` | secret | Signs upload links; at least 32 characters (e.g. `openssl rand -hex 32`). Unset = no upload links |
+| `UPLOAD_SECRET` | secret | Optional. Signs upload links; at least 32 characters (e.g. `openssl rand -hex 32`). Unset = a key derived from `MOIN_PASSWORD`; an anonymous wiki needs it for upload links |
 
 If the Access or wiki settings are missing or invalid, `/mcp` answers `500`
 instead of opening up. `xmlrpc` must not be in the wiki's `actions_excluded`.
@@ -62,9 +62,18 @@ Every upload returns `size` and `sha256`; `put_attachment` takes an expected
 
 ### How upload links work
 
-The token is stateless: HMAC-SHA256 with `UPLOAD_SECRET` over the page, the
-attachment name (as MoinMoin will store it), a size cap, an expiry (15 min
-by default, at most 60) and the attachment's state when the link was made:
+Each link is different: the token is `<data>.<signature>`, where `<data>`
+holds the upload's details and `<signature>` is HMAC-SHA256 over them, so the
+Worker reads the page and name from the link itself and needs no storage. The
+signing key is `UPLOAD_SECRET` if set; otherwise it is derived from
+`MOIN_PASSWORD` with HKDF-SHA256 (salted with `MOIN_URL`), so no extra setup
+is needed. Changing the password, or setting `UPLOAD_SECRET` later,
+invalidates open links. On an anonymous wiki, upload links need
+`UPLOAD_SECRET`.
+
+The data covers the page, the attachment name (as MoinMoin will store it), a
+size cap, an expiry (15 min by default, at most 60) and the attachment's
+state when the link was made:
 absent, or the SHA-256 of its current content. An upload is accepted only
 while the attachment is still in that state, so the first upload uses the
 link up, and so does anyone else attaching that name in the meantime. The
@@ -82,7 +91,7 @@ password. `/mcp` keeps requiring Access. The upload page sends
 Responses from `PUT /upload/<token>` are JSON: `200` with `size`, `sha256`
 and the page `url`; `401` invalid or expired link; `409` link already used
 (or the attachment changed); `413` over the link's size cap; `403` writes
-disabled; `503` no `UPLOAD_SECRET`.
+disabled; `503` no signing key (anonymous wiki without `UPLOAD_SECRET`).
 
 ### Limits outside the Worker
 

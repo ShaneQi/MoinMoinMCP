@@ -3,7 +3,7 @@
 import { callWiki, pageUrl, WikiError } from "./moin.js";
 import { base64ToBytes, bytesToBase64, XmlRpcDateTime } from "./xmlrpc.js";
 import { BodyError, readCapped, sha256Hex } from "./bytes.js";
-import { createUploadLink, LinkError, LINK_DEFAULT_MINUTES, LINK_MAX_BYTES, LINK_MAX_MINUTES } from "./uploadlink.js";
+import { createUploadLink, linkSecret, LinkError, LINK_DEFAULT_MINUTES, LINK_MAX_BYTES, LINK_MAX_MINUTES } from "./uploadlink.js";
 
 /** A tool failure, reported to Claude as the tool's error text. */
 export class ToolError extends Error {}
@@ -305,8 +305,8 @@ export const TOOLS = [
     ["page", "name"], WRITE,
     async ({ args, ctx }) => {
       ctx.requireWrites();
-      if (!ctx.settings.uploadSecret || !ctx.settings.origin) {
-        throw new ToolError("UPLOAD_LINKS_UNAVAILABLE: set the UPLOAD_SECRET secret on the server to enable upload links");
+      if (!ctx.settings.origin || !(await linkSecret(ctx.settings))) {
+        throw new ToolError("UPLOAD_LINKS_UNAVAILABLE: an anonymous wiki needs the UPLOAD_SECRET secret on the server for upload links");
       }
       if (!args.name.trim()) throw new ToolError("INVALID_ARGUMENTS: name must not be empty");
       try {

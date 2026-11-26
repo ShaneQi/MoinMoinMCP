@@ -3,7 +3,7 @@
 // `curl -T file <url>` from a shell, or the upload page in a browser — so its
 // bytes never pass through the conversation.
 //
-// The token is stateless: HMAC-SHA256 (UPLOAD_SECRET) over the page, the
+// The token is stateless: HMAC-SHA256 (see linkSecret) over the page, the
 // attachment name, a size cap, an expiry, and the attachment's state when the
 // link was made (null = absent, else the SHA-256 of its content). An upload is
 // accepted only while the attachment is still in that state, so after the
@@ -31,6 +31,23 @@ export function taintFilename(name) {
   let s = name;
   for (const x of ["..", ":", "/", "\\", "<", ">"]) s = s.split(x).join("_");
   return s;
+}
+
+/**
+ * The key that signs links: UPLOAD_SECRET if set, otherwise one derived from
+ * MOIN_PASSWORD with HKDF-SHA256 (salted with the wiki URL, so the password
+ * itself never signs anything and other wikis get other keys). null on an
+ * anonymous wiki with no UPLOAD_SECRET: upload links are then off. Changing
+ * the password invalidates open links, which last an hour at most anyway.
+ */
+export async function linkSecret(settings) {
+  if (settings.uploadSecret) return settings.uploadSecret;
+  if (!settings.password) return null;
+  const base = await crypto.subtle.importKey("raw", enc.encode(settings.password), "HKDF", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits(
+    { name: "HKDF", hash: "SHA-256", salt: enc.encode(`moinmoin-mcp ${settings.url}`), info: enc.encode("upload links v1") },
+    base, 256);
+  return b64url(new Uint8Array(bits));
 }
 
 const hmacKey = (secret) =>
@@ -78,7 +95,7 @@ export async function attachmentState(settings, page, name, call = callWiki) {
   return sha256Hex(data);
 }
 
-/** Makes a link; the caller has checked writes are enabled and the secret is set. */
+/** Makes a link; the caller has checked writes are enabled and that linkSecret(settings) is not null. */
 export async function createUploadLink(settings, { page, name, overwrite, minutes, maxBytes }, call = callWiki) {
   const stored = taintFilename(name);
   const state = await attachmentState(settings, page, stored, call);
@@ -86,7 +103,7 @@ export async function createUploadLink(settings, { page, name, overwrite, minute
     throw new LinkError(409, `ATTACHMENT_EXISTS: ${stored} is already attached to ${page}; pass overwrite: true to replace it`);
   }
   const expires = Math.floor(Date.now() / 1000) + minutes * 60;
-  const token = await signToken(settings.uploadSecret, { p: page, n: stored, h: state, m: maxBytes, e: expires });
+  const token = await signToken(await linkSecret(settings), { p: page, n: stored, h: state, m: maxBytes, e: expires });
   const url = `${settings.origin}/upload/${token}`;
   return {
     upload_url: url,
@@ -165,11 +182,12 @@ export async function handleUpload(request, settings, token, call = callWiki) {
     return new Response("Method not allowed\n", { status: 405, headers: { Allow: "GET, PUT" } });
   }
   const fail = (status, message) => (page ? errorPage(status, message) : json({ error: message }, status));
-  if (!settings.uploadSecret) return fail(503, "UPLOAD_LINKS_UNAVAILABLE: the server has no UPLOAD_SECRET");
+  const secret = await linkSecret(settings);
+  if (!secret) return fail(503, "UPLOAD_LINKS_UNAVAILABLE: set UPLOAD_SECRET (or MOIN_USER and MOIN_PASSWORD) on the server");
 
   let claims;
   try {
-    claims = await verifyToken(settings.uploadSecret, token);
+    claims = await verifyToken(secret, token);
   } catch (e) {
     if (e instanceof LinkError) return fail(e.status, e.message);
     throw e;

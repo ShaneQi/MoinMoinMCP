@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import worker from "../src/index.js";
 import { TOOLS, runTool } from "../src/tools.js";
-import { signToken, taintFilename } from "../src/uploadlink.js";
+import { linkSecret, signToken, taintFilename } from "../src/uploadlink.js";
 import { installFakeWiki, WIKI } from "./fake-wiki.js";
 
 const SECRET = "s".repeat(40);
@@ -114,12 +114,37 @@ test("size cap, empty body and wrong methods", async () => {
   assert.equal((await upload(out.upload_url, bytes(1000))).status, 200);
 });
 
-test("upload links need the secret and writes, and the secret must be long enough", async () => {
-  assert.match((await link({ page: "P", name: "n" }, { ...SETTINGS, uploadSecret: "" })).error, /UPLOAD_LINKS_UNAVAILABLE/);
+test("upload links need writes, and a long enough UPLOAD_SECRET if one is set", async () => {
   const { out } = await link({ page: "P", name: "n" });
-  assert.equal((await upload(out.upload_url, bytes(3), { ...ENV, UPLOAD_SECRET: undefined })).status, 503);
   assert.equal((await upload(out.upload_url, bytes(3), { ...ENV, ALLOW_WRITES: "false" })).status, 403);
   assert.equal((await upload(out.upload_url, bytes(3), { ...ENV, UPLOAD_SECRET: "short" })).status, 500);
+});
+
+test("without UPLOAD_SECRET, links are signed with a key derived from MOIN_PASSWORD", async () => {
+  const noSecret = { ...ENV, UPLOAD_SECRET: undefined };
+  const derived = { ...SETTINGS, uploadSecret: "" };
+  const key = await linkSecret(derived);
+  assert.match(key, /^[A-Za-z0-9_-]{43}$/);
+  assert.notEqual(key, "pw");
+  assert.equal(await linkSecret(derived), key); // stable across calls and instances
+  assert.notEqual(await linkSecret({ ...derived, password: "pw2" }), key);
+  assert.notEqual(await linkSecret({ ...derived, url: "https://other.example/" }), key);
+
+  const { error, out } = await link({ page: "P", name: "n" }, derived);
+  assert.equal(error, null);
+  assert.equal((await upload(out.upload_url, bytes(3), noSecret)).status, 200);
+  // a link signed with the derived key is no good once a different UPLOAD_SECRET is set, or the password changes
+  const second = (await link({ page: "P", name: "m" }, derived)).out.upload_url;
+  assert.equal((await upload(second, bytes(3), ENV)).status, 401);
+  assert.equal((await upload(second, bytes(3), { ...noSecret, MOIN_PASSWORD: "other" })).status, 401);
+});
+
+test("an anonymous wiki without UPLOAD_SECRET has no upload links", async () => {
+  const anon = { ...SETTINGS, username: "", password: "", uploadSecret: "" };
+  assert.match((await link({ page: "P", name: "n" }, anon)).error, /UPLOAD_LINKS_UNAVAILABLE/);
+  const token = await signToken("x".repeat(40), { p: "P", n: "n", h: null, m: 10, e: Date.now() / 1000 + 60 });
+  const r = await upload(`${ORIGIN}/upload/${token}`, bytes(3), { MOIN_URL: WIKI, ALLOW_WRITES: "true" });
+  assert.equal(r.status, 503);
 });
 
 test("names are stored the way MoinMoin taints them", async () => {
